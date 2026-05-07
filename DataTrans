@@ -1,0 +1,99 @@
+from pyspark.sql.functions import col, sha2, year, month, date_format, current_timestamp, when
+from pyspark.sql import functions as F
+
+# 1. Setup Paths
+adls, container = "itcbdneadls", "cat-training-bd-uk"
+GOLD_PATH = f"abfss://{container}@{adls}.dfs.core.windows.net/sri/Insurance_Project/gold/"
+
+# 2. Load Silver Tables
+customers_df = spark.table("silver_sri_customers")
+policies_df  = spark.table("silver_sri_policies")
+claims_df    = spark.table("silver_sri_claims")
+payments_df  = spark.table("silver_sri_payments")
+
+# -----------------------------
+# DIMENSIONS
+# -----------------------------
+dim_customer = customers_df \
+    .withColumn("customer_key", sha2(col("customer_id").cast("string"), 256)) \
+    .select("customer_key", "customer_id", "name", "age", "gender", "city", "occupation", "credit_score")
+
+dim_policy = policies_df \
+    .withColumn("policy_key", sha2(col("policy_id").cast("string"), 256)) \
+    .select("policy_key", "policy_id", "customer_id", "policy_type", "start_date", "end_date", "premium_amount", "policy_status")
+
+dim_date = claims_df.select(col("claim_date").alias("date")) \
+    .union(payments_df.select(col("payment_date").alias("date"))) \
+    .dropDuplicates(["date"]) \
+    .filter(col("date").isNotNull()) \
+    .withColumn("year", year("date")) \
+    .withColumn("month", month("date")) \
+    .withColumn("date_key", date_format("date", "yyyyMMdd").cast("int"))
+
+# -----------------------------
+# FACT TABLES
+# -----------------------------
+fact_claims = claims_df.join(policies_df.select("policy_id", "customer_id"), "policy_id", "left") \
+    .join(dim_customer, "customer_id", "left") \
+    .join(dim_policy, "policy_id", "left") \
+    .join(dim_date, claims_df["claim_date"] == dim_date["date"], "left") \
+    .select(
+        "claim_id", 
+        "customer_key", 
+        "policy_key", 
+        "date_key", 
+        "claim_amount", 
+        "claim_status", 
+        "incident_type", 
+        col("fraud_flag").cast("string").alias("fraud_flag"),
+        when(col("fraud_flag") == 1, "FRAUD").otherwise("GENUINE").alias("fraud_status"),
+        when(col("claim_amount") < 5000, "LOW")
+        .when((col("claim_amount") >= 5000) & (col("claim_amount") < 20000), "MEDIUM")
+        .otherwise("HIGH").alias("claim_category")
+    ) \
+    .dropDuplicates(["claim_id"])
+
+from pyspark.sql.functions import col, when
+
+fact_payments = payments_df \
+    .join(claims_df.select("claim_id", "policy_id"), "claim_id", "left") \
+    .join(policies_df.select("policy_id", "customer_id"), "policy_id", "left") \
+    .join(dim_customer, "customer_id", "left") \
+    .join(dim_policy, "policy_id", "left") \
+    .join(dim_date, payments_df["payment_date"] == dim_date["date"], "left") \
+    .withColumn("payment_category", 
+        when(col("payment_amount") < 5000, "LOW")
+        .when((col("payment_amount") >= 5000) & (col("payment_amount") < 18000), "MEDIUM")
+        .otherwise("HIGH")
+    ) \
+    .select(
+        "payment_id", 
+        "customer_key", 
+        "policy_key", 
+        "date_key", 
+        "payment_amount", 
+        "payment_category", 
+        "payment_method"
+    ) \
+    .dropDuplicates(["payment_id"])
+
+
+# -----------------------------
+# WRITE TO GOLD (Run this ONCE)
+# -----------------------------
+gold_tables = {
+    "dim_customer": dim_customer,
+    "dim_policy": dim_policy,
+    "dim_date": dim_date,
+    "fact_claims": fact_claims,
+    "fact_payments": fact_payments
+}
+
+for table_name, df in gold_tables.items():
+    (df.write.format("delta")
+       .mode("overwrite")
+       .option("path", f"{GOLD_PATH}{table_name}")
+       .option("overwriteSchema", "true")
+       .saveAsTable(f"gold_sri_{table_name}"))
+
+print("GOLD LAYER WRITTEN TO ADLS & CATALOG")
